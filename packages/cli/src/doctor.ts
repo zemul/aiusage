@@ -164,6 +164,8 @@ export async function runDoctor(lang: Lang = 'zh'): Promise<Check[]> {
     { dir: join(home, '.factory', 'sessions'), label: 'Droid', exts: ['.jsonl', '.json'] },
     { dir: join(home, '.local', 'share', 'opencode'), label: 'OpenCode', exts: ['.json'] },
     { dir: join(home, '.pi', 'agent', 'sessions'), label: 'Pi', exts: ['.jsonl'] },
+    { dir: join(home, '.kiro', 'sessions', 'cli'), label: 'Kiro', exts: ['.json'] },
+    { dir: join(home, '.hermes', 'sessions'), label: 'Hermes', exts: ['.json'] },
   ];
 
   for (const tool of tools) {
