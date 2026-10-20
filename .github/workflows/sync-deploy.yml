@@ -1,0 +1,95 @@
+name: Update and deploy personal AIUsage
+
+on:
+  schedule:
+    - cron: '20 0 * * *' # Daily at 08:20 Asia/Shanghai
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-aiusage-production
+  cancel-in-progress: false
+
+jobs:
+  update-and-deploy:
+    if: github.repository == 'zemul/aiusage'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Merge upstream on scheduled and manual runs
+        if: github.event_name != 'push'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/imetn/aiusage.git
+          git fetch upstream main
+          git merge upstream/main --no-edit
+
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r lint
+      - run: pnpm -r test
+      - run: pnpm build
+
+      - name: Persist validated upstream updates
+        if: github.event_name != 'push'
+        run: git push origin HEAD:main
+
+      - name: Configure existing Worker and database
+        env:
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_WORKER_NAME: ${{ secrets.CLOUDFLARE_WORKER_NAME }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const databaseId = process.env.CLOUDFLARE_D1_DATABASE_ID;
+          const workerName = process.env.CLOUDFLARE_WORKER_NAME;
+          if (!databaseId || !workerName) throw new Error('Missing Cloudflare deployment secrets');
+          const path = 'packages/worker/wrangler.jsonc';
+          let config = fs.readFileSync(path, 'utf8');
+          config = config.replace(/"name":\s*"[^"]+"/, '"name": ' + JSON.stringify(workerName));
+          if (/"database_id":\s*"[^"]*"/.test(config)) {
+            config = config.replace(/"database_id":\s*"[^"]*"/, '"database_id": ' + JSON.stringify(databaseId));
+          } else {
+            config = config.replace(/("database_name":\s*"[^"]+")/, '$1,\n      "database_id": ' + JSON.stringify(databaseId));
+          }
+          fs.writeFileSync(path, config);
+          NODE
+
+      - name: Apply migrations and deploy
+        working-directory: packages/worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo 'Missing CLOUDFLARE_API_TOKEN'; exit 1; }
+          pnpm exec wrangler d1 migrations apply aiusage-db --remote
+          pnpm run deploy
+
+      - name: Record deployment
+        run: |
+          {
+            echo '### AIUsage deployment'
+            echo "Deployed commit: $(git rev-parse HEAD)"
+            echo 'Worker: aiusage'
+            echo 'Daily update: 08:20 Asia/Shanghai'
+            echo 'Existing Worker secrets and D1 database are preserved.'
+          } >> "$GITHUB_STEP_SUMMARY"
