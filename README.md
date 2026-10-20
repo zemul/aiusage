@@ -44,6 +44,7 @@ A self-hosted, privacy-first system for tracking how much you spend on AI coding
   <img src="https://img.shields.io/badge/Droid-2C3E50?style=for-the-badge&logo=android&logoColor=white" alt="Droid" />
   <img src="https://img.shields.io/badge/OpenCode-16A34A?style=for-the-badge&logo=go&logoColor=white" alt="OpenCode" />
   <img src="https://img.shields.io/badge/Pi-6C47FF?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjx0ZXh0IHg9IjUiIHk9IjE4IiBmb250LXNpemU9IjE2IiBmb250LWZhbWlseT0ic2VyaWYiPsO/PC90ZXh0Pjwvc3ZnPg==&logoColor=white" alt="Pi" />
+  <img src="https://img.shields.io/badge/Trae-7C3AED?style=for-the-badge&logoColor=white" alt="Trae" />
 </p>
 
 ### Why AIUsage?
@@ -70,7 +71,7 @@ graph LR
 Copy this prompt, paste it into your AI coding agent (Claude Code, Codex, Copilot, Gemini, etc.):
 
 ```text
-Clone https://github.com/ennann/aiusage.git, read skills/aiusage-server/aiusage-server.md,
+Clone https://github.com/imetn/aiusage.git, read skills/aiusage-server/aiusage-server.md,
 and help me deploy AIUsage to my Cloudflare account.
 After the server is up, follow skills/aiusage-cli/aiusage-cli.md to connect this device.
 ```
@@ -78,7 +79,7 @@ After the server is up, follow skills/aiusage-cli/aiusage-cli.md to connect this
 ### Or deploy manually
 
 ```bash
-git clone https://github.com/ennann/aiusage.git
+git clone https://github.com/imetn/aiusage.git
 cd aiusage && pnpm install
 npx wrangler login
 pnpm setup

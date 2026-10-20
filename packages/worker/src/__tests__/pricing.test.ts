@@ -2,7 +2,12 @@
 //   pnpm --filter @aiusage/worker add -D vitest
 
 import { describe, it, expect } from 'vitest';
-import { calculateCost, getPricingCatalog, getWorstCostStatus } from '../utils/pricing.js';
+import {
+  calculateCost,
+  calculateIngestBreakdownCost,
+  getPricingCatalog,
+  getWorstCostStatus,
+} from '../utils/pricing.js';
 
 // ─── getPricingCatalog ───
 
@@ -19,6 +24,110 @@ describe('getPricingCatalog', () => {
 // ─── calculateCost: 基本计费 ───
 
 describe('calculateCost: 基本计费', () => {
+  it('优先采用 scanner 按请求累计的精确成本', () => {
+    const result = calculateIngestBreakdownCost({
+      provider: 'openai',
+      product: 'codex',
+      channel: 'cli',
+      model: 'gpt-5.6-sol',
+      project: '/tmp/project',
+      eventCount: 2,
+      inputTokens: 500_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 20_000,
+      reasoningOutputTokens: 0,
+      costUSD: 4.1,
+      pricingVersion: getPricingCatalog().version,
+    });
+
+    expect(result.estimatedCostUsd).toBe(4.1);
+    expect(result.costStatus).toBe('exact');
+  });
+
+  it('定价版本不一致时拒绝客户端预计算成本', () => {
+    const result = calculateIngestBreakdownCost({
+      provider: 'openai',
+      product: 'codex',
+      channel: 'cli',
+      model: 'gpt-5.6-sol',
+      project: '/tmp/project',
+      eventCount: 2,
+      inputTokens: 500_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 20_000,
+      reasoningOutputTokens: 0,
+      costUSD: 4.1,
+      pricingVersion: 'stale-catalog',
+    });
+
+    expect(result.estimatedCostUsd).toBe(2.4);
+    expect(result.costStatus).toBe('estimated');
+  });
+
+  it('始终采用 Trae 国际版官方 API 返回的账号费用', () => {
+    const result = calculateIngestBreakdownCost({
+      provider: 'openai',
+      product: 'trae-intl',
+      channel: 'ide',
+      model: 'gpt-5.4',
+      project: 'unknown',
+      eventCount: 1,
+      inputTokens: 100,
+      cachedInputTokens: 200,
+      cacheWriteTokens: 0,
+      outputTokens: 20,
+      reasoningOutputTokens: 0,
+      costUSD: 0.25,
+      pricingVersion: 'stale-catalog',
+    });
+
+    expect(result.estimatedCostUsd).toBe(0.25);
+    expect(result.costStatus).toBe('exact');
+  });
+
+  it('始终采用 OpenCode 消息中持久化的供应商费用', () => {
+    const result = calculateIngestBreakdownCost({
+      provider: 'openai',
+      product: 'opencode',
+      channel: 'cli',
+      model: 'gpt-5.6',
+      project: '/tmp/project',
+      eventCount: 2,
+      inputTokens: 500,
+      cachedInputTokens: 100,
+      cacheWriteTokens: 0,
+      outputTokens: 50,
+      reasoningOutputTokens: 0,
+      costUSD: 0.42,
+      pricingVersion: 'opencode-provider',
+    });
+
+    expect(result.estimatedCostUsd).toBe(0.42);
+    expect(result.costStatus).toBe('exact');
+  });
+
+  it('忽略旧 scanner 用作缺省值的零成本', () => {
+    const result = calculateIngestBreakdownCost({
+      provider: 'openai',
+      product: 'codex',
+      channel: 'cli',
+      model: 'gpt-5.6-sol',
+      project: '/tmp/project',
+      eventCount: 2,
+      inputTokens: 400_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 20_000,
+      reasoningOutputTokens: 0,
+      costUSD: 0,
+    });
+
+    expect(result.estimatedCostUsd).toBe(2);
+    expect(result.costStatus).toBe('estimated');
+  });
+
   it('Claude haiku-4-5 基本 input/output 计费', () => {
     // haiku-4-5: input=$1/M, output=$5/M
     const result = calculateCost('anthropic', 'claude-code', 'claude-haiku-4-5', {
@@ -47,28 +156,28 @@ describe('calculateCost: 基本计费', () => {
   });
 
   it('Codex gpt-5.4 基本 input/output 计费', () => {
-    // gpt-5.4: input=$2.5/M, output=$15/M
+    // gpt-5.4 long context: input=$5/M, output=$22.5/M
     const result = calculateCost('openai', 'codex', 'gpt-5.4', {
       inputTokens: 2_000_000,
       cachedInputTokens: 0,
       cacheWriteTokens: 0,
       outputTokens: 500_000,
     });
-    // 2*2.5 + 0.5*15 = 5 + 7.5 = $12.5
-    expect(result.estimatedCostUsd).toBe(12.5);
+    // 2*5 + 0.5*22.5 = $21.25
+    expect(result.estimatedCostUsd).toBe(21.25);
     expect(result.costStatus).toBe('exact');
   });
 
   it('Codex gpt-5.5 基本 input/output 计费', () => {
-    // gpt-5.5: input=$5/M, cached input=$0.50/M, output=$30/M
+    // gpt-5.5 long context: input=$10/M, cached input=$1/M, output=$45/M
     const result = calculateCost('openai', 'codex', 'gpt-5.5', {
       inputTokens: 1_000_000,
       cachedInputTokens: 1_000_000,
       cacheWriteTokens: 0,
       outputTokens: 500_000,
     });
-    // 1*5 + 1*0.5 + 0.5*30 = $20.5
-    expect(result.estimatedCostUsd).toBe(20.5);
+    // 1*10 + 1*1 + 0.5*45 = $33.5
+    expect(result.estimatedCostUsd).toBe(33.5);
     expect(result.costStatus).toBe('exact');
   });
 
@@ -79,9 +188,29 @@ describe('calculateCost: 基本计费', () => {
       cacheWriteTokens: 0,
       outputTokens: 1_000_000,
     });
-    // gpt-5.4: 1*2.5 + 1*0.25 + 1*15 = $17.75
-    expect(result.estimatedCostUsd).toBe(17.75);
+    // gpt-5.4 long context: 1*5 + 1*0.5 + 1*22.5 = $28
+    expect(result.estimatedCostUsd).toBe(28);
     // codex-auto-review 是 catalog 里的显式 alias → gpt-5.4，按 exact 处理
+    expect(result.costStatus).toBe('exact');
+  });
+
+  it('Kimi Code k3 按 Kimi K3 官方价格估算', () => {
+    const result = calculateIngestBreakdownCost({
+      provider: 'moonshot',
+      product: 'kimi-code',
+      channel: 'cli',
+      model: 'k3',
+      project: '/tmp/project',
+      eventCount: 1,
+      inputTokens: 1_000_000,
+      cachedInputTokens: 2_000_000,
+      cacheWriteTokens: 500_000,
+      outputTokens: 100_000,
+      reasoningOutputTokens: 0,
+    });
+
+    expect(result.resolvedModel).toBe('kimi-k3');
+    expect(result.estimatedCostUsd).toBeCloseTo(44 / 7.2, 4);
     expect(result.costStatus).toBe('exact');
   });
 });

@@ -52,8 +52,14 @@ export async function resolvePricingCatalog(
   const cache = await readPricingCache();
   const ttlHours = config.pricing?.cacheTtlHours ?? DEFAULT_CACHE_TTL_HOURS;
 
+  // auto 模式下远端/缓存可能落后于新版 CLI 内置目录（如服务端未升级、缓存未过期），取较新者
+  const preferNewer = (resolved: ResolvedPricingCatalog): ResolvedPricingCatalog =>
+    mode === 'auto' && !options.explicitUrl && isOlderVersion(resolved.info.version, bundledCatalog.version)
+      ? { catalog: bundledCatalog, info: { source: 'bundled', version: bundledCatalog.version } }
+      : resolved;
+
   if (!options.forceRefresh && cache && (mode === 'manual' || mode === 'offline' || isCacheFresh(cache, ttlHours))) {
-    return fromCache(cache);
+    return preferNewer(fromCache(cache));
   }
 
   if ((mode !== 'offline' || options.forceRefresh) && (mode === 'auto' || options.forceRefresh)) {
@@ -63,17 +69,17 @@ export async function resolvePricingCatalog(
         const catalog = await fetchPricingCatalog(url);
         const fetchedAt = new Date().toISOString();
         await writePricingCache({ fetchedAt, sourceUrl: url, catalog });
-        return {
+        return preferNewer({
           catalog,
           info: { source: 'remote', version: catalog.version, url, fetchedAt },
-        };
+        });
       } catch {
         // Try the next source; report/sync must not fail just because pricing refresh failed.
       }
     }
   }
 
-  if (cache) return fromCache(cache);
+  if (cache) return preferNewer(fromCache(cache));
 
   return {
     catalog: bundledCatalog,
@@ -127,6 +133,11 @@ function getPricingUrls(
   ].filter((url): url is string => Boolean(url));
 
   return [...new Set(urls.map((url) => url.trim()).filter(Boolean))];
+}
+
+/** 目录版本以 YYYY-MM-DD 开头，按字典序比较即为时间先后。 */
+function isOlderVersion(version: string, than: string): boolean {
+  return version.localeCompare(than) < 0;
 }
 
 function isCacheFresh(cache: PricingCacheFile, ttlHours: number): boolean {

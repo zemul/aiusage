@@ -24,6 +24,8 @@ describe('catalog 结构', () => {
       ['cursor', 'cursor'],
       ['droid', 'droid'],
       ['opencode', 'opencode'],
+      ['xai', 'opencode'],
+      ['xai', 'copilot-cli'],
     ];
     const missing = required.filter(([p, pr]) => !catalog.providers[p]?.[pr]);
     expect(missing).toEqual([]);
@@ -41,17 +43,68 @@ describe('calculateCost — 关键模型', () => {
   };
 
   it.each([
+    ['anthropic', 'claude-code', 'claude-fable-5-1', 60], // 10 + 50
+    ['anthropic', 'claude-code', 'claude-fable-5', 60], // 10 + 50
+    ['anthropic', 'claude-code', 'claude-mythos-5', 60], // 10 + 50
+    ['anthropic', 'claude-code', 'claude-opus-5-5', 24], // 4 + 20
+    ['anthropic', 'claude-code', 'claude-opus-5.5', 24], // alias → claude-opus-5-5
+    ['anthropic', 'claude-code', 'claude-opus-5', 30], // 5 + 25
     ['anthropic', 'claude-code', 'claude-opus-4-8', 30], // 5 + 25
     ['anthropic', 'claude-code', 'claude-opus-4-7', 30], // 5 + 25
+    ['anthropic', 'claude-code', 'claude-sonnet-5', 12], // 2 + 10（intro through 2026-08-31）
     ['anthropic', 'claude-code', 'claude-sonnet-4-6', 18],
-    ['openai', 'codex', 'gpt-5.4', 17.5], // 2.5 + 15
-    ['openai', 'codex', 'gpt-5.5-pro', 210], // 30 + 180
+    ['openai', 'codex', 'gpt-6-astra', 95], // 长上下文：20 + 75
+    ['openai', 'codex', 'gpt-6-sol', 19], // 长上下文：4 + 15
+    ['openai', 'codex', 'gpt-6-luna', 0.95], // 长上下文：0.2 + 0.75
+    ['xai', 'opencode', 'grok-4.7', 16], // 长上下文：4 + 12
+    ['openai', 'codex', 'gpt-5.6-sol', 38], // 长上下文：8 + 30
+    ['openai', 'codex', 'gpt-5.6-terra', 22], // 长上下文：4 + 18
+    ['openai', 'codex', 'gpt-5.6-luna', 2.2], // 长上下文：0.4 + 1.8
+    ['openai', 'codex', 'gpt-5.4', 27.5], // 长上下文：5 + 22.5
+    ['openai', 'codex', 'gpt-5.5-pro', 330], // 长上下文：60 + 270
     ['openai', 'codex', 'o3-deep-research', 25], // 5 + 20，修正后
     ['openai', 'codex', 'computer-use-preview', 7.5], // 1.5 + 6，修正后
     ['google', 'gemini-cli', 'gemini-2.5-flash', 2.8], // 0.30 + 2.50，修正后
+    ['moonshot', 'kimi-code', 'k3', 120 / 7.2], // alias → kimi-k3，¥20 + ¥100
   ])('%s/%s/%s 应等于 $%s', (provider, product, model, expected) => {
     const r = calculateCost(provider, product, model, tokens);
     expect(r.costStatus).toBe('exact');
+    expect(r.estimatedCostUsd).toBeCloseTo(expected, 4);
+  });
+
+  it.each([
+    ['openai', 'codex', 'gpt-6-sol', 1.145], // 0.05M×2 + 0.1M×0.2 + 0.01M×2.5 + 0.1M×10
+    ['openai', 'codex', 'gpt-6-luna', 0.05725], // 0.05M×0.1 + 0.1M×0.01 + 0.01M×0.125 + 0.1M×0.5
+    ['xai', 'copilot-cli', 'grok-4.7', 0.77], // 0.05M×2 + 0.1M×0.5 + 0.01M×2（写缓存按输入价）+ 0.1M×6
+  ])('%s/%s/%s 短上下文含缓存为 $%s', (provider, product, model, expected) => {
+    const r = calculateCost(provider, product, model, {
+      inputTokens: 50_000, cachedInputTokens: 100_000, cacheWriteTokens: 10_000, outputTokens: 100_000,
+    });
+    expect(r.matchedTierIndex).toBe(0);
+    expect(r.estimatedCostUsd).toBeCloseTo(expected, 3);
+  });
+
+  it('Opus 5.5 缓存读写按专属费率计费', () => {
+    const r = calculateCost('anthropic', 'claude-code', 'claude-opus-5-5', {
+      inputTokens: 0,
+      cachedInputTokens: 1_000_000,
+      cacheWriteTokens: 1_000_000,
+      cacheWrite5mTokens: 1_000_000,
+      cacheWrite1hTokens: 1_000_000,
+      outputTokens: 0,
+    });
+    expect(r.estimatedCostUsd).toBeCloseTo(0.2 + 5 + 8, 4);
+  });
+
+  it.each([
+    ['anthropic', 'claude-code', 'claude-opus-5-5-fast', 48],
+    ['openai', 'codex', 'gpt-6-sol-fast', 24],
+    ['openai', 'codex', 'gpt-6-luna-priority', 1.2],
+    ['xai', 'opencode', 'grok-4.7-fast', 16],
+  ])('%s/%s/%s fast/priority 按 2x 计为 $%s', (provider, product, model, expected) => {
+    const r = calculateCost(provider, product, model, {
+      inputTokens: 1_000_000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1_000_000,
+    }, { requestCount: 10 });
     expect(r.estimatedCostUsd).toBeCloseTo(expected, 4);
   });
 
@@ -65,6 +118,15 @@ describe('calculateCost — 关键模型', () => {
     const r = calculateCost('anthropic', 'claude-code', 'claude-opus-4-7-20260201', tokens);
     expect(r.resolvedModel).toBe('claude-opus-4-7');
     expect(r.costStatus).toBe('exact');
+  });
+
+  it('常见误写别名解析为 exact', () => {
+    const fable = calculateCost('anthropic', 'claude-code', 'claude-fibre-5', tokens);
+    const opus = calculateCost('anthropic', 'claude-code', 'claude-ops-5', tokens);
+    expect(fable.resolvedModel).toBe('claude-fable-5');
+    expect(fable.costStatus).toBe('exact');
+    expect(opus.resolvedModel).toBe('claude-opus-5');
+    expect(opus.costStatus).toBe('exact');
   });
 
   it('语义化未知后缀触发前缀回退（estimated）', () => {
@@ -129,10 +191,16 @@ describe('Fast 模式白名单', () => {
     outputTokens: 1_000_000,
   };
 
-  it('Opus 4.8-fast 应 ×6', () => {
+  it('Opus 5-fast 应 ×2', () => {
+    const fast = calculateCost('anthropic', 'claude-code', 'claude-opus-5-fast', tokens);
+    const normal = calculateCost('anthropic', 'claude-code', 'claude-opus-5', tokens);
+    expect(fast.estimatedCostUsd).toBeCloseTo(normal.estimatedCostUsd * 2, 3);
+  });
+
+  it('Opus 4.8-fast 应 ×2', () => {
     const fast = calculateCost('anthropic', 'claude-code', 'claude-opus-4-8-fast', tokens);
     const normal = calculateCost('anthropic', 'claude-code', 'claude-opus-4-8', tokens);
-    expect(fast.estimatedCostUsd).toBeCloseTo(normal.estimatedCostUsd * 6, 3);
+    expect(fast.estimatedCostUsd).toBeCloseTo(normal.estimatedCostUsd * 2, 3);
   });
 
   it('Opus 4.7-fast 应 ×6', () => {
@@ -141,10 +209,10 @@ describe('Fast 模式白名单', () => {
     expect(fast.estimatedCostUsd).toBeCloseTo(normal.estimatedCostUsd * 6, 3);
   });
 
-  it('Opus 4.6-fast 应 ×6', () => {
+  it('Opus 4.6-fast 现按标准价', () => {
     const fast = calculateCost('anthropic', 'claude-code', 'claude-opus-4-6-fast', tokens);
     const normal = calculateCost('anthropic', 'claude-code', 'claude-opus-4-6', tokens);
-    expect(fast.estimatedCostUsd).toBeCloseTo(normal.estimatedCostUsd * 6, 3);
+    expect(fast.estimatedCostUsd).toBe(normal.estimatedCostUsd);
   });
 
   it('Sonnet-fast 不应 ×6（官方不支持）', () => {
@@ -169,6 +237,24 @@ describe('Fast 模式白名单', () => {
     const priority = calculateCost('openai', 'codex', 'gpt-5.5-priority', tokens);
     const normal = calculateCost('openai', 'codex', 'gpt-5.5', tokens);
     expect(priority.estimatedCostUsd).toBeCloseTo(normal.estimatedCostUsd * 2.5, 3);
+  });
+
+  it('Codex GPT-5.6 Terra priority 应 ×2', () => {
+    const priority = calculateCost('openai', 'codex', 'gpt-5.6-terra-priority', tokens);
+    const normal = calculateCost('openai', 'codex', 'gpt-5.6-terra', tokens);
+    expect(priority.estimatedCostUsd).toBeCloseTo(normal.estimatedCostUsd * 2, 3);
+  });
+
+  it('Codex GPT-6 Astra fast 应 ×2', () => {
+    const fast = calculateCost('openai', 'codex', 'gpt-6-astra-fast', tokens);
+    const normal = calculateCost('openai', 'codex', 'gpt-6-astra', tokens);
+    expect(fast.estimatedCostUsd).toBeCloseTo(normal.estimatedCostUsd * 2, 3);
+  });
+
+  it('Codex GPT-5.6 Fast 尚未获官方支持时不放大', () => {
+    const fast = calculateCost('openai', 'codex', 'gpt-5.6-sol-fast', tokens);
+    const normal = calculateCost('openai', 'codex', 'gpt-5.6-sol', tokens);
+    expect(fast.estimatedCostUsd).toBe(normal.estimatedCostUsd);
   });
 
   it('Codex GPT-5.4 fast 应 ×2', () => {
@@ -199,6 +285,19 @@ describe('多币种折算', () => {
     expect(r.costStatus).toBe('exact');
   });
 
+  it('Kimi Code 的 k3 别名应命中 Kimi K3，并区分缓存命中价格', () => {
+    const r = calculateCost('moonshot', 'kimi-code', 'k3', {
+      inputTokens: 1_000_000,
+      cachedInputTokens: 2_000_000,
+      cacheWriteTokens: 500_000,
+      outputTokens: 100_000,
+    });
+    // input ¥20 + cached ¥4 + cache miss/write ¥10 + output ¥10 = ¥44 → $6.1111
+    expect(r.resolvedModel).toBe('kimi-k3');
+    expect(r.estimatedCostUsd).toBeCloseTo(44 / 7.2, 4);
+    expect(r.costStatus).toBe('exact');
+  });
+
   it('DeepSeek v4-flash 已是 USD，不折算', () => {
     const r = calculateCost('deepseek', 'deepseek-chat', 'deepseek-v4-flash', {
       inputTokens: 1_000_000,
@@ -214,6 +313,101 @@ describe('多币种折算', () => {
 // ─── 阶梯定价 ───
 
 describe('阶梯定价', () => {
+  it('GPT-5.6 Sol 的 gpt-5.6 别名命中短上下文价格', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-5.6', {
+      inputTokens: 100_000,
+      cachedInputTokens: 100_000,
+      cacheWriteTokens: 50_000,
+      cacheWrite5mTokens: 50_000,
+      cacheWrite1hTokens: 0,
+      outputTokens: 20_000,
+    });
+    // 0.1*$4 + 0.1*$0.4 + 0.05*$5 + 0.02*$20 = $1.09
+    expect(r.resolvedModel).toBe('gpt-5.6-sol');
+    expect(r.matchedTierIndex).toBe(0);
+    expect(r.costStatus).toBe('exact');
+    expect(r.estimatedCostUsd).toBeCloseTo(1.09, 4);
+  });
+
+  it('GPT-6 Astra 精确区分缓存读写并命中短上下文价格', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-6-astra', {
+      inputTokens: 10_000,
+      cachedInputTokens: 60_000,
+      cacheWriteTokens: 30_000,
+      outputTokens: 10_000,
+    });
+    expect(r.matchedTierIndex).toBe(0);
+    expect(r.estimatedCostUsd).toBeCloseTo(1.035, 4);
+  });
+
+  it('GPT-6 Astra 超过 272K input 后整次请求命中长上下文价格', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-6-astra', {
+      inputTokens: 300_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 100_000,
+    });
+    expect(r.matchedTierIndex).toBe(1);
+    expect(r.estimatedCostUsd).toBeCloseTo(13.5, 4);
+  });
+
+  it('Claude Fable 5.1 缓存读写使用独立价格', () => {
+    const r = calculateCost('anthropic', 'claude-code', 'claude-fable-5-1', {
+      inputTokens: 100_000,
+      cachedInputTokens: 100_000,
+      cacheWriteTokens: 100_000,
+      cacheWrite5mTokens: 60_000,
+      cacheWrite1hTokens: 40_000,
+      outputTokens: 10_000,
+    });
+    expect(r.estimatedCostUsd).toBeCloseTo(3.075, 4);
+  });
+
+  it('GPT-5.6 Sol 超过 272K input 后整次请求命中长上下文价格', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-5.6-sol', {
+      inputTokens: 300_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 100_000,
+    });
+    expect(r.matchedTierIndex).toBe(1);
+    expect(r.estimatedCostUsd).toBeCloseTo(5.4, 4); // 0.3*$8 + 0.1*$30
+  });
+
+  it('GPT-5.6 Sol 的聚合用量按平均单请求 input 选择阶梯', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-5.6-sol', {
+      inputTokens: 400_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 20_000,
+    }, { requestCount: 2 });
+    expect(r.matchedTierIndex).toBe(0);
+    expect(r.costStatus).toBe('estimated');
+    expect(r.estimatedCostUsd).toBeCloseTo(2, 4); // 两个 200K + 10K output 的短请求
+  });
+
+  it('GPT-5.5 的短请求继续使用短上下文价格', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-5.5', {
+      inputTokens: 100_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 10_000,
+    });
+    expect(r.matchedTierIndex).toBe(0);
+    expect(r.estimatedCostUsd).toBeCloseTo(0.8, 4);
+  });
+
+  it('GPT-5.4 超过 272K input 后使用长上下文价格', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-5.4', {
+      inputTokens: 300_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 100_000,
+    });
+    expect(r.matchedTierIndex).toBe(1);
+    expect(r.estimatedCostUsd).toBeCloseTo(3.75, 4);
+  });
+
   it('Qwen3-coder-plus ≤32K 命中第 0 档', () => {
     const r = calculateCost('alibaba', 'qwen-code', 'qwen3-coder-plus', {
       inputTokens: 10_000,
@@ -256,5 +450,39 @@ describe('阶梯定价', () => {
       outputTokens: 1_000,
     });
     expect(r.matchedTierIndex).toBe(1);
+  });
+});
+
+// Sources verified 2026-10-20: OpenAI GPT-6.1 Sol model card and Anthropic pricing.
+describe('October 2026 pricing gaps', () => {
+  it('GPT-6.1 Sol includes its 5% cache-read and cache-write rates', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-6.1-sol', {
+      inputTokens: 50_000, cachedInputTokens: 100_000, cacheWriteTokens: 10_000, outputTokens: 100_000,
+    });
+    expect(r.costStatus).toBe('exact');
+    expect(r.estimatedCostUsd).toBeCloseTo(1.135, 4);
+    expect(r.matchedTierIndex).toBe(0);
+  });
+  it('GPT-6.1 Sol charges the full request above 272K input tokens', () => {
+    const r = calculateCost('openai', 'codex', 'gpt-6.1-sol', {
+      inputTokens: 200_000, cachedInputTokens: 100_000, cacheWriteTokens: 10_000, outputTokens: 100_000,
+    });
+    expect(r.estimatedCostUsd).toBeCloseTo(2.37, 4);
+    expect(r.matchedTierIndex).toBe(1);
+  });
+  it.each([['fast', 2], ['priority', 2], ['ultrafast', 6]])('GPT-6.1 Sol %s has an explicit multiplier', (tier, multiplier) => {
+    const r = calculateCost('openai', 'codex', `gpt-6.1-sol-${tier}`, {
+      inputTokens: 100_000, cachedInputTokens: 100_000, cacheWriteTokens: 0, outputTokens: 100_000,
+    });
+    expect(r.estimatedCostUsd).toBeCloseTo(1.21 * Number(multiplier), 4);
+  });
+  it('Sonnet 5.5 distinguishes cache reads and both cache-write lifetimes', () => {
+    const r = calculateCost('anthropic', 'claude-code', 'claude-sonnet-5-5', {
+      inputTokens: 1_000_000, cachedInputTokens: 1_000_000,
+      cacheWriteTokens: 2_000_000, cacheWrite5mTokens: 1_000_000, cacheWrite1hTokens: 1_000_000,
+      outputTokens: 1_000_000,
+    });
+    expect(r.costStatus).toBe('exact');
+    expect(r.estimatedCostUsd).toBeCloseTo(18.6, 4);
   });
 });

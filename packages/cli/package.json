@@ -1,17 +1,17 @@
 {
   "name": "@aiusage/cli",
-  "version": "1.7.1",
+  "version": "1.8.2",
   "description": "Track and sync AI tool token usage across devices.",
   "license": "MIT",
   "private": false,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ennann/aiusage.git",
+    "url": "git+https://github.com/imetn/aiusage.git",
     "directory": "packages/cli"
   },
-  "homepage": "https://github.com/ennann/aiusage",
+  "homepage": "https://github.com/imetn/aiusage",
   "bugs": {
-    "url": "https://github.com/ennann/aiusage/issues"
+    "url": "https://github.com/imetn/aiusage/issues"
   },
   "type": "module",
   "publishConfig": {
@@ -21,6 +21,7 @@
     "dist",
     "pricing-catalog.json",
     "README.md",
+    "THIRD_PARTY_NOTICES.md",
     "LICENSE"
   ],
   "bin": {
@@ -36,6 +37,9 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
   },
   "scripts": {
     "build": "rm -rf dist && node build.mjs",

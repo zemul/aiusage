@@ -63,6 +63,8 @@ interface ChartTooltipContentProps extends React.HTMLAttributes<HTMLDivElement> 
   showTotal?: boolean;
   totalLabel?: string;
   totalFormatter?: (value: number) => React.ReactNode;
+  /** 隐藏数值为 0 的项，并按数值从高到低排列。 */
+  hideZeroSortDesc?: boolean;
 }
 
 export function ChartTooltipContent({
@@ -76,12 +78,19 @@ export function ChartTooltipContent({
   showTotal = false,
   totalLabel = 'Total',
   totalFormatter,
+  hideZeroSortDesc = false,
   className,
   ...props
 }: ChartTooltipContentProps): React.JSX.Element | null {
   const { config } = useChart();
 
-  if (!active || !payload?.length) return null;
+  const items = hideZeroSortDesc
+    ? (payload ?? [])
+        .filter((it) => Number(it.value ?? 0) > 0)
+        .sort((a, b) => Number(b.value ?? 0) - Number(a.value ?? 0))
+    : payload;
+
+  if (!active || !items?.length) return null;
 
   return (
     <div
@@ -97,7 +106,7 @@ export function ChartTooltipContent({
         </div>
       ) : null}
       <div className="grid gap-2">
-        {payload.map((item) => {
+        {items.map((item) => {
           const key = String(item.dataKey ?? item.name ?? 'value');
           const itemConfig = config[key];
           const tone = item.color ?? item.stroke ?? itemConfig?.color ?? 'currentColor';
@@ -117,7 +126,7 @@ export function ChartTooltipContent({
           );
         })}
         {showTotal ? (() => {
-          const sum = payload.reduce((acc, it) => acc + Number(it.value ?? 0), 0);
+          const sum = items.reduce((acc, it) => acc + Number(it.value ?? 0), 0);
           return (
             <div className="mt-1 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2.5 border-t border-slate-200/80 pt-2 dark:border-white/10">
               <span className="h-2.5 w-2.5" />
