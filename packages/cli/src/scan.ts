@@ -38,6 +38,8 @@ export interface ScanOptions {
 }
 
 export const TOOL_IDS = [
+  'kiro',
+  'hermes',
   'amp',
   'antigravity',
   'claude-code',

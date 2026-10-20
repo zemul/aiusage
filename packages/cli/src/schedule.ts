@@ -1,5 +1,5 @@
-import { realpathSync } from 'node:fs';
-import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { constants, realpathSync } from 'node:fs';
+import { access, mkdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { homedir, platform, tmpdir } from 'node:os';
@@ -62,6 +62,22 @@ export async function getScheduleStatus(): Promise<ScheduleStatus> {
 
 // ── resolve paths ──
 
+export async function resolveScheduledNodePath(execPath = process.execPath): Promise<string> {
+  // Node resolves its executable symlink, so process.execPath pins a Homebrew
+  // Cellar version that can disappear on upgrade. Keep a matching stable link.
+  const homebrew = execPath.match(/^(.*)\/Cellar\/(node(?:@[^/]+)?)\/[^/]+\/bin\/node$/);
+  if (!homebrew) return execPath;
+
+  const [, prefix, formula] = homebrew;
+  for (const candidate of [join(prefix, 'bin', 'node'), join(prefix, 'opt', formula, 'bin', 'node')]) {
+    try {
+      await access(candidate, constants.X_OK);
+      if (await realpath(candidate) === execPath) return candidate;
+    } catch { /* Missing or unusable link; try the next stable path. */ }
+  }
+  return execPath;
+}
+
 export function resolveCommandPaths(): { nodePath: string; scriptPath: string } {
   const entryPath = process.argv[1];
   if (!entryPath) throw new Error('无法解析当前 aiusage 命令路径');
@@ -77,7 +93,9 @@ export function resolveCommandPaths(): { nodePath: string; scriptPath: string } 
 // ── macOS launchd ──
 
 async function enableLaunchd(intervalSeconds: number): Promise<ScheduleStatus> {
-  const { nodePath, scriptPath } = resolveCommandPaths();
+  const paths = resolveCommandPaths();
+  const nodePath = await resolveScheduledNodePath(paths.nodePath);
+  const { scriptPath } = paths;
   await mkdir(join(homedir(), '.aiusage'), { recursive: true });
 
   const plist = [
@@ -156,7 +174,9 @@ async function getLaunchdStatus(): Promise<ScheduleStatus> {
 // ── Linux cron ──
 
 async function enableCron(intervalSeconds: number): Promise<ScheduleStatus> {
-  const { nodePath, scriptPath } = resolveCommandPaths();
+  const paths = resolveCommandPaths();
+  const nodePath = await resolveScheduledNodePath(paths.nodePath);
+  const { scriptPath } = paths;
   const cronExpr = secondsToCron(intervalSeconds);
   const logPath = join(homedir(), '.aiusage', 'sync.log');
   const cronLine = `${cronExpr} ${nodePath} ${scriptPath} sync --today >> ${logPath} 2>&1 ${CRON_MARKER}`;
