@@ -1,8 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import * as zlib from 'node:zlib';
 import { discoverProjects } from '../project.js';
+
+const { mockHomedir } = vi.hoisted(() => ({ mockHomedir: vi.fn() }));
+vi.mock('node:os', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:os')>(),
+  homedir: () => mockHomedir(),
+}));
 
 /** 向指定目录写入 JSONL 文件 */
 async function writeJsonl(dir: string, filename: string, lines: object[]): Promise<void> {
@@ -18,8 +25,10 @@ let origKimiCodeHome: string | undefined;
 beforeEach(async () => {
   tmpDir = join(tmpdir(), `aiusage-project-test-${Date.now()}`);
   await mkdir(tmpDir, { recursive: true });
+  mockHomedir.mockReturnValue(tmpDir);
   origEnv = process.env.CLAUDE_CONFIG_DIR;
   origKimiCodeHome = process.env.KIMI_CODE_HOME;
+  delete process.env.KIMI_CODE_HOME;
 });
 
 afterEach(async () => {
@@ -179,5 +188,32 @@ describe('跳过隐藏目录', () => {
     const names = results.map((p) => p.name);
     expect(names).toContain('VisibleProject');
     expect(names).not.toContain('.hidden-project');
+  });
+});
+
+// ─── Codex 压缩会话项目发现 ───
+
+describe('Codex 项目发现', () => {
+  it('从 .jsonl.zst 压缩会话中提取项目名', async () => {
+    const zstdCompressSync = (zlib as unknown as { zstdCompressSync?: (buf: Buffer) => Buffer }).zstdCompressSync;
+    if (typeof zstdCompressSync !== 'function') return;
+
+    process.env.CLAUDE_CONFIG_DIR = join(tmpDir, 'empty-claude');
+    const codexDir = join(tmpDir, '.codex', 'sessions', '2026', '05', '10');
+    await mkdir(codexDir, { recursive: true });
+    const compressed = zstdCompressSync(Buffer.from(JSON.stringify({
+      type: 'session_meta',
+      timestamp: '2026-05-10T12:00:00.000Z',
+      payload: { id: 'sess-zst', cwd: '/Users/test/Projects/CompressedRepo' },
+    }) + '\n', 'utf-8'));
+    await writeFile(join(codexDir, 'rollout-2026-05-10.jsonl.zst'), compressed);
+
+    const results = await discoverProjects();
+    expect(results).toContainEqual(
+      expect.objectContaining({
+        name: 'CompressedRepo',
+        sources: expect.arrayContaining(['codex']),
+      }),
+    );
   });
 });

@@ -173,6 +173,129 @@ describe('JSONL scanning', () => {
     expect(b.provider).toBe('model_api');
   });
 
+  it('去除 group/factory/grok 等路由前缀并按底层模型 ID 推断供应商', async () => {
+    const projectDir = join(tmpDir, 'projects', '-Users-test-project');
+    await writeJsonl(projectDir, 'session.jsonl', [
+      claudeRecord({ timestamp: '2026-11-17T10:00:00.000Z', requestId: 'req_1', model: 'claude-opus-5-5', inputTokens: 100, outputTokens: 50 }),
+      claudeRecord({ timestamp: '2026-11-17T10:01:00.000Z', requestId: 'req_2', model: 'group/auto-claude-opus-5-5', inputTokens: 200, outputTokens: 70 }),
+      claudeRecord({ timestamp: '2026-11-17T10:02:00.000Z', requestId: 'req_3', model: 'group/auto-claude-fable-5-2:high', inputTokens: 300, outputTokens: 80 }),
+      claudeRecord({ timestamp: '2026-11-17T10:03:00.000Z', requestId: 'req_4', model: 'factory/claude-fable-5.2', inputTokens: 400, outputTokens: 90 }),
+      claudeRecord({ timestamp: '2026-11-17T10:04:00.000Z', requestId: 'req_5', model: 'group/auto-grok-4-7', inputTokens: 500, outputTokens: 100 }),
+      claudeRecord({ timestamp: '2026-11-17T10:05:00.000Z', requestId: 'req_6', model: 'grok/grok-4.7', inputTokens: 600, outputTokens: 110 }),
+      claudeRecord({ timestamp: '2026-11-17T10:06:00.000Z', requestId: 'req_7', model: 'group/auto-deepseek-v4-1-flash', inputTokens: 700, outputTokens: 120 }),
+      claudeRecord({ timestamp: '2026-11-17T10:07:00.000Z', requestId: 'req_8', model: 'group/unknown-lab-model', inputTokens: 800, outputTokens: 130 }),
+    ]);
+
+    const breakdowns = (await scanClaudeDates(['2026-11-17'], join(tmpDir, 'projects'))).get('2026-11-17')!;
+    const byKey = new Map(breakdowns.map(b => [`${b.provider}/${b.model}`, b]));
+
+    expect(byKey.get('anthropic/claude-opus-5-5')).toEqual(expect.objectContaining({
+      eventCount: 2, inputTokens: 300, outputTokens: 120,
+    }));
+    expect(byKey.get('anthropic/claude-fable-5-2')).toEqual(expect.objectContaining({
+      eventCount: 2, inputTokens: 700, outputTokens: 170,
+    }));
+    expect(byKey.get('xai/grok-4.7')).toEqual(expect.objectContaining({
+      eventCount: 2, inputTokens: 1100, outputTokens: 210,
+    }));
+    expect(byKey.get('deepseek/deepseek-v4.1-flash')).toEqual(expect.objectContaining({
+      eventCount: 1, inputTokens: 700, outputTokens: 120,
+    }));
+    expect(byKey.get('unknown/unknown-lab-model')).toEqual(expect.objectContaining({
+      eventCount: 1, inputTokens: 800, outputTokens: 130,
+    }));
+    expect([...byKey.keys()].some(k => k.startsWith('group/') || k.startsWith('factory/') || k.startsWith('grok/'))).toBe(false);
+  });
+
+  it('跨文件去重同一 message.id 的有/无 requestId 副本，同时保留同 message.id 不同 requestId', async () => {
+    const dirA = join(tmpDir, 'projects', '-Users-test-a');
+    const dirB = join(tmpDir, 'projects', '-Users-test-b');
+    await writeJsonl(dirA, 'a.jsonl', [
+      {
+        type: 'assistant', timestamp: '2026-11-23T11:30:36.000Z', cwd: '/Users/test/a',
+        requestId: 'req_1',
+        message: { id: 'msg_shared', model: 'claude-fable-5-2', usage: { input_tokens: 10, output_tokens: 600 } },
+      },
+      {
+        type: 'assistant', timestamp: '2026-11-23T11:31:00.000Z', cwd: '/Users/test/a',
+        message: { id: 'msg_reverse', model: 'claude-fable-5-2', usage: { input_tokens: 20, output_tokens: 400 } },
+      },
+    ]);
+    await writeJsonl(dirB, 'b.jsonl', [
+      {
+        type: 'assistant', timestamp: '2026-11-23T11:30:36.500Z', cwd: '/Users/test/b',
+        message: { id: 'msg_shared', model: 'claude-fable-5-2', usage: { input_tokens: 10, output_tokens: 600 } },
+      },
+      {
+        type: 'assistant', timestamp: '2026-11-23T11:31:00.500Z', cwd: '/Users/test/b',
+        requestId: 'req_reverse',
+        message: { id: 'msg_reverse', model: 'claude-fable-5-2', usage: { input_tokens: 20, output_tokens: 400 } },
+      },
+      {
+        type: 'assistant', timestamp: '2026-11-23T11:32:00.000Z', cwd: '/Users/test/b',
+        requestId: 'req_2',
+        message: { id: 'msg_shared', model: 'claude-fable-5-2', usage: { input_tokens: 5, output_tokens: 100 } },
+      },
+    ]);
+
+    const breakdowns = (await scanClaudeDates(['2026-11-23'], join(tmpDir, 'projects'))).get('2026-11-23')!;
+    const totalEvents = breakdowns.reduce((s, b) => s + b.eventCount, 0);
+    const totalOutput = breakdowns.reduce((s, b) => s + b.outputTokens, 0);
+    expect(totalEvents).toBe(3); // msg_shared:req_1 + msg_reverse + msg_shared:req_2
+    expect(totalOutput).toBe(1100);
+  });
+
+  it('统计 usage.iterations 中的 advisor_message 嵌套模型用量并正确去重', async () => {
+    const projectDir = join(tmpDir, 'projects', '-Users-test-project');
+    const recordWithAdvisor = {
+      type: 'assistant',
+      timestamp: '2026-11-17T12:00:00.000Z',
+      requestId: 'req_adv_1',
+      cwd: '/Users/test/project',
+      message: {
+        id: 'msg_adv_1',
+        model: 'claude-sonnet-5-5',
+        usage: {
+          input_tokens: 1_000,
+          output_tokens: 200,
+          cache_read_input_tokens: 5_000,
+          iterations: [
+            {
+              type: 'message',
+              input_tokens: 1_000,
+              output_tokens: 200,
+            },
+            {
+              type: 'advisor_message',
+              model: 'claude-opus-5-5',
+              input_tokens: 2_000,
+              output_tokens: 400,
+              cache_read_input_tokens: 3_000,
+              cache_creation_input_tokens: 500,
+            },
+          ],
+        },
+      },
+    };
+    await writeJsonl(projectDir, 'session.jsonl', [recordWithAdvisor, recordWithAdvisor]);
+
+    const breakdowns = (await scanClaudeDates(['2026-11-17'], join(tmpDir, 'projects'))).get('2026-11-17')!;
+    const byModel = new Map(breakdowns.map((b) => [b.model, b]));
+    expect(byModel.get('claude-sonnet-5-5')).toMatchObject({
+      eventCount: 1,
+      inputTokens: 1_000,
+      cachedInputTokens: 5_000,
+      outputTokens: 200,
+    });
+    expect(byModel.get('claude-opus-5-5')).toMatchObject({
+      eventCount: 1,
+      inputTokens: 2_000,
+      cachedInputTokens: 3_000,
+      cacheWriteTokens: 500,
+      outputTokens: 400,
+    });
+  });
+
   it('returns empty array for a date with no JSONL data and no stats-cache', async () => {
     const result = await scanClaudeDates(['2025-11-01'], join(tmpDir, 'projects'));
     expect(result.get('2025-11-01')).toEqual([]);

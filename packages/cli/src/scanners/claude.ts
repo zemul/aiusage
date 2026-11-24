@@ -3,13 +3,26 @@ import { readdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
-import type { IngestBreakdown } from '@aiusage/shared';
+import { isRoutingProvider, normalizeRoutedModel, type IngestBreakdown } from '@aiusage/shared';
 import { inferProviderFromModel, keepFilesModifiedSince, normalizeModelName, runWithConcurrency, type ProjectFields } from './utils.js';
 
 const FILE_CONCURRENCY = 16;
 const MAX_LINE_BYTES = 64 * 1024 * 1024; // 64 MB
 const MAX_COWORK_DISCOVERY_DEPTH = 8;
 const COWORK_IGNORED_DIRS = new Set(['rpm', 'skills']);
+
+interface ClaudeUsageIteration {
+  type?: string;
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number;
+    ephemeral_1h_input_tokens?: number;
+  };
+}
 
 interface ClaudeRecord {
   timestamp?: string;
@@ -38,6 +51,7 @@ interface ClaudeRecord {
         ephemeral_1h_input_tokens?: number;
       };
       speed?: 'standard' | 'fast';
+      iterations?: ClaudeUsageIteration[];
     };
   };
 }
@@ -147,8 +161,9 @@ export async function scanClaudeDates(
   const baseDirs = await discoverClaudeProjectDirs(claudeDir);
 
   // Claude Code 某些代理/兼容模型没有 requestId，但仍会把同一 messageId
-  // 复制到父会话和 sidechain 文件；此时退化为 message.id 去重。
+  // 复制到父会话和 sidechain 文件；此时退化为 message.id 去重，并跨有/无 requestId 副本共享。
   const processedHashes = new Map<string, ClaudeSeenUsage>();
+  const processedByMessageId = new Map<string, ClaudeSeenUsage>();
 
   // Track distinct sessions per "date|model|project" group
   const sessionSets = new Map<string, Set<string>>();
@@ -185,7 +200,7 @@ export async function scanClaudeDates(
 
   // 并发流式处理文件，直接聚合到 groupedByDate
   await runWithConcurrency(recentJobs, FILE_CONCURRENCY, async (job) => {
-    await processJsonlFile(job.filePath, job.projectFields, targetDateSet, projectAliases, groupedByDate, processedHashes, sessionSets);
+    await processJsonlFile(job.filePath, job.projectFields, targetDateSet, projectAliases, groupedByDate, processedHashes, processedByMessageId, sessionSets);
   });
 
   // Assign session counts from collected sessionSets
@@ -209,6 +224,7 @@ async function processJsonlFile(
   projectAliases: Record<string, string> | undefined,
   groupedByDate: Map<string, Map<string, IngestBreakdown>>,
   processedHashes: Map<string, ClaudeSeenUsage>,
+  processedByMessageId: Map<string, ClaudeSeenUsage>,
   sessionSets: Map<string, Set<string>>,
 ): Promise<void> {
   // Derive fallback sessionId from filename (e.g. "abc-123.jsonl" → "abc-123")
@@ -253,79 +269,124 @@ async function processJsonlFile(
         : undefined;
 
       const usage = message.usage;
-      let model = normalizeModelName(rawModel);
-      if (usage.speed === 'fast') model = `${model}-fast`;
-      const provider = resolveClaudeProvider(record, rawModel);
       const recordFields = record.cwd ? resolveProject(record.cwd, projectAliases) : fallbackFields;
       const sessionId = record.sessionId ?? fallbackSessionId;
       const costUSD = record.costUSD ?? 0;
 
-      const cacheCreation = usage.cache_creation;
-      let cache5m = cacheCreation?.ephemeral_5m_input_tokens ?? 0;
-      const cache1h = cacheCreation?.ephemeral_1h_input_tokens ?? 0;
-      // 无明细时退化到总量
-      if (cache5m === 0 && cache1h === 0 && (usage.cache_creation_input_tokens ?? 0) > 0) {
-        cache5m = usage.cache_creation_input_tokens!;
-      }
-
       const grouped = groupedByDate.get(usageDate);
       if (!grouped) continue;
 
-      const snapshot: ClaudeUsageSnapshot = {
-        input: clampToken(usage.input_tokens),
-        cached: clampToken(usage.cache_read_input_tokens),
-        cacheWrite: clampToken(usage.cache_creation_input_tokens)
-          || clampToken(cache5m) + clampToken(cache1h),
-        cache5m: clampToken(cache5m),
-        cache1h: clampToken(cache1h),
-        output: clampToken(usage.output_tokens),
-        costUSD: clampToken(costUSD),
-      };
-      const cacheWriteTokens = snapshot.cacheWrite;
-      const seen = hash ? processedHashes.get(hash) : undefined;
-      if (seen) {
-        mergeClaudeDuplicate(seen, snapshot);
-        continue;
-      }
-      const key = `${provider}|${model}|${recordFields.project}`;
+      const recordUsageEntry = (
+        entryRawModel: string,
+        entryUsage: {
+          input_tokens?: number;
+          output_tokens?: number;
+          cache_read_input_tokens?: number;
+          cache_creation_input_tokens?: number;
+          cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number };
+        },
+        entryCostUSD: number,
+        entryMessageId: string | undefined,
+        entryHash: string | undefined,
+        entryFallbackMessageHash: string | undefined,
+      ) => {
+        const routed = normalizeRoutedModel(entryRawModel);
+        let model = normalizeModelName(routed.model);
+        if (usage.speed === 'fast' && !model.endsWith('-fast')) model = `${model}-fast`;
+        const provider = resolveClaudeProvider(record, routed.model, routed.stripped);
 
-      // Track distinct sessions per group
-      const sessionSetKey = `${usageDate}|${key}`;
-      if (!sessionSets.has(sessionSetKey)) sessionSets.set(sessionSetKey, new Set());
-      sessionSets.get(sessionSetKey)!.add(sessionId);
+        const cacheCreation = entryUsage.cache_creation;
+        let cache5m = cacheCreation?.ephemeral_5m_input_tokens ?? 0;
+        const cache1h = cacheCreation?.ephemeral_1h_input_tokens ?? 0;
+        if (cache5m === 0 && cache1h === 0 && (entryUsage.cache_creation_input_tokens ?? 0) > 0) {
+          cache5m = entryUsage.cache_creation_input_tokens!;
+        }
 
-      const existing = grouped.get(key);
-      if (existing) {
-        existing.eventCount += 1;
-        existing.inputTokens += snapshot.input;
-        existing.cachedInputTokens += snapshot.cached;
-        existing.cacheWriteTokens += cacheWriteTokens;
-        existing.cacheWrite5mTokens = (existing.cacheWrite5mTokens ?? 0) + snapshot.cache5m;
-        existing.cacheWrite1hTokens = (existing.cacheWrite1hTokens ?? 0) + snapshot.cache1h;
-        existing.outputTokens += snapshot.output;
-        existing.costUSD = (existing.costUSD ?? 0) + snapshot.costUSD;
-        if (hash) processedHashes.set(hash, { breakdown: existing, snapshot });
-      } else {
-        const breakdown: IngestBreakdown = {
-          provider,
-          product: 'claude-code',
-          channel: 'cli',
-          model,
-          project: recordFields.project,
-          projectDisplay: recordFields.projectDisplay,
-          projectAlias: recordFields.projectAlias,
-          eventCount: 1,
-          inputTokens: snapshot.input,
-          cachedInputTokens: snapshot.cached,
-          cacheWriteTokens,
-          cacheWrite5mTokens: snapshot.cache5m,
-          cacheWrite1hTokens: snapshot.cache1h,
-          outputTokens: snapshot.output,
-          reasoningOutputTokens: 0,
-          costUSD: snapshot.costUSD,
+        const snapshot: ClaudeUsageSnapshot = {
+          input: clampToken(entryUsage.input_tokens),
+          cached: clampToken(entryUsage.cache_read_input_tokens),
+          cacheWrite: clampToken(entryUsage.cache_creation_input_tokens)
+            || clampToken(cache5m) + clampToken(cache1h),
+          cache5m: clampToken(cache5m),
+          cache1h: clampToken(cache1h),
+          output: clampToken(entryUsage.output_tokens),
+          costUSD: clampToken(entryCostUSD),
         };
-        grouped.set(key, breakdown);
-        if (hash) processedHashes.set(hash, { breakdown, snapshot });
+        const cacheWriteTokens = snapshot.cacheWrite;
+        const seen = entryHash
+          ? (requestId
+              ? (processedHashes.get(entryHash) ?? (entryFallbackMessageHash ? processedHashes.get(entryFallbackMessageHash) : undefined))
+              : (processedHashes.get(entryHash) ?? (entryMessageId ? processedByMessageId.get(entryMessageId) : undefined)))
+          : undefined;
+        if (seen) {
+          mergeClaudeDuplicate(seen, snapshot);
+          if (requestId && entryHash) {
+            processedHashes.set(entryHash, seen);
+            if (entryFallbackMessageHash) processedHashes.delete(entryFallbackMessageHash);
+          }
+          if (entryMessageId && !processedByMessageId.has(entryMessageId)) processedByMessageId.set(entryMessageId, seen);
+          return;
+        }
+        const key = `${provider}|${model}|${recordFields.project}`;
+
+        const sessionSetKey = `${usageDate}|${key}`;
+        if (!sessionSets.has(sessionSetKey)) sessionSets.set(sessionSetKey, new Set());
+        sessionSets.get(sessionSetKey)!.add(sessionId);
+
+        const existing = grouped.get(key);
+        if (existing) {
+          existing.eventCount += 1;
+          existing.inputTokens += snapshot.input;
+          existing.cachedInputTokens += snapshot.cached;
+          existing.cacheWriteTokens += cacheWriteTokens;
+          existing.cacheWrite5mTokens = (existing.cacheWrite5mTokens ?? 0) + snapshot.cache5m;
+          existing.cacheWrite1hTokens = (existing.cacheWrite1hTokens ?? 0) + snapshot.cache1h;
+          existing.outputTokens += snapshot.output;
+          existing.costUSD = (existing.costUSD ?? 0) + snapshot.costUSD;
+          const entry: ClaudeSeenUsage = { breakdown: existing, snapshot };
+          if (entryHash) processedHashes.set(entryHash, entry);
+          if (entryMessageId && !processedByMessageId.has(entryMessageId)) processedByMessageId.set(entryMessageId, entry);
+        } else {
+          const breakdown: IngestBreakdown = {
+            provider,
+            product: 'claude-code',
+            channel: 'cli',
+            model,
+            project: recordFields.project,
+            projectDisplay: recordFields.projectDisplay,
+            projectAlias: recordFields.projectAlias,
+            eventCount: 1,
+            inputTokens: snapshot.input,
+            cachedInputTokens: snapshot.cached,
+            cacheWriteTokens,
+            cacheWrite5mTokens: snapshot.cache5m,
+            cacheWrite1hTokens: snapshot.cache1h,
+            outputTokens: snapshot.output,
+            reasoningOutputTokens: 0,
+            costUSD: snapshot.costUSD,
+          };
+          grouped.set(key, breakdown);
+          const entry: ClaudeSeenUsage = { breakdown, snapshot };
+          if (entryHash) processedHashes.set(entryHash, entry);
+          if (entryMessageId && !processedByMessageId.has(entryMessageId)) processedByMessageId.set(entryMessageId, entry);
+        }
+      };
+
+      const fallbackMessageHash = messageId ? `message:${messageId}` : undefined;
+      recordUsageEntry(rawModel, usage, costUSD, messageId, hash, fallbackMessageHash);
+
+      // Top-level `usage` covers the executor alone; advisor calls run on another model and
+      // appear only inside `usage.iterations` with type === 'advisor_message'.
+      if (Array.isArray(usage.iterations)) {
+        for (const [index, iteration] of usage.iterations.entries()) {
+          if (!iteration || iteration.type !== 'advisor_message') continue;
+          const advisorModel = typeof iteration.model === 'string' ? iteration.model.trim() : '';
+          if (!advisorModel || advisorModel === '<synthetic>') continue;
+          const advisorMsgId = messageId ? `${messageId}:advisor:${index}` : undefined;
+          const advisorHash = hash ? `${hash}:advisor:${index}` : undefined;
+          const advisorFallbackHash = fallbackMessageHash ? `${fallbackMessageHash}:advisor:${index}` : undefined;
+          recordUsageEntry(advisorModel, iteration, 0, advisorMsgId, advisorHash, advisorFallbackHash);
+        }
       }
     }
   } catch {
@@ -363,7 +424,7 @@ function clampToken(value: number | undefined): number {
   return Math.max(Number.isFinite(value) ? value! : 0, 0);
 }
 
-function resolveClaudeProvider(record: ClaudeRecord, model: string): string {
+function resolveClaudeProvider(record: ClaudeRecord, model: string, routingStripped = false): string {
   const explicit = (
     record.message?.providerId
     ?? record.message?.provider_id
@@ -372,12 +433,12 @@ function resolveClaudeProvider(record: ClaudeRecord, model: string): string {
     ?? record.provider_id
     ?? record.provider
   )?.trim().toLowerCase();
-  const prefix = model.trim().toLowerCase().match(/^([a-z0-9_-]+)\//)?.[1];
+  const prefix = routingStripped ? undefined : model.trim().toLowerCase().match(/^([a-z0-9_-]+)\//)?.[1];
   const inferred = prefix ?? inferProviderFromModel(model, 'unknown');
-  // 一些兼容层会固定写 anthropic，但模型名已明确指向其他供应商。
-  if (explicit && explicit !== 'anthropic') return explicit;
+  // 一些兼容层/路由网关会固定写 anthropic 或 group/factory，若模型名已明确指向底层供应商则优先采用推断值。
+  if (explicit && explicit !== 'anthropic' && !isRoutingProvider(explicit)) return explicit;
   if (inferred !== 'unknown') return inferred;
-  return explicit ?? 'unknown';
+  return explicit && !isRoutingProvider(explicit) ? explicit : 'unknown';
 }
 
 function parseTimestamp(value?: string): Date | null {

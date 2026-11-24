@@ -1,4 +1,4 @@
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { IngestBreakdown } from '@aiusage/shared';
@@ -6,7 +6,11 @@ import {
   parseTs, dateKey, initDateMap, accumulate, finalize, inferProviderFromModel, resolveProjectFields,
 } from './utils.js';
 import {
-  deduplicateAntigravityUsage, readAntigravityConversation,
+  ANTIGRAVITY_MODEL_IDS,
+  deduplicateAntigravityUsage,
+  isConcreteAntigravityModel,
+  readAntigravityConversation,
+  rememberAntigravityModel,
   type AntigravityUsage,
 } from './antigravity-db.js';
 
@@ -30,14 +34,53 @@ async function entries(path: string) {
   }
 }
 
+export async function discoverAntigravityRoots(
+  baseDir?: string,
+  homeDir = homedir(),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string[]> {
+  if (baseDir) return [baseDir];
+  const configured = env.ANTIGRAVITY_DATA_DIR?.split(',').map(v => v.trim()).filter(Boolean) ?? [];
+  const candidates = configured.length > 0
+    ? configured
+    : [
+        ...['antigravity', 'antigravity-cli', 'antigravity-ide', 'antigravity-backup'].map(name => join(homeDir, '.gemini', name)),
+        join(homeDir, '.config', 'antigravity'),
+      ];
+  const t3ProvidersDir = join(homeDir, '.t3', 'userdata', 'providers', 'antigravity');
+  try {
+    const providerEntries = (await readdir(t3ProvidersDir, { withFileTypes: true }))
+      .filter(entry => entry.isDirectory() || entry.isSymbolicLink())
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of providerEntries) {
+      candidates.push(join(t3ProvidersDir, entry.name, 'antigravity-acp'));
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new Error('Antigravity history directory could not be read; sync was stopped to preserve previous uploads', { cause: error });
+    }
+  }
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const candidate of candidates) {
+    let canonical = candidate;
+    try { canonical = await realpath(candidate); } catch { /* Missing roots are skipped later. */ }
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    unique.push(candidate);
+  }
+  return unique;
+}
+
 async function readAntigravityData(baseDir?: string): Promise<AntigravityData> {
-  const roots = baseDir ? [baseDir] : ['antigravity', 'antigravity-cli', 'antigravity-ide'].map(name => join(homedir(), '.gemini', name));
+  const roots = await discoverAntigravityRoots(baseDir);
   const records: AntigravityUsage[] = [];
   const contexts = new Map<string, UsageContext>();
   const legacy = new Map<string, { timestamp: Date; channel: 'cli' | 'ide' }>();
   const sessionsWithUsage = new Set<string>();
+  const learnedModels = new Map<number, string | null>();
   for (const root of roots) {
-    const channel = root.endsWith('antigravity-cli') ? 'cli' : 'ide';
+    const channel = root.endsWith('antigravity-cli') || root.endsWith('antigravity-acp') ? 'cli' : 'ide';
     const dates = new Map<string, Date>();
     await collectBrainSessionDates(join(root, 'brain'), dates);
     await collectBrowserSessionDates(join(root, 'browser_recordings'), dates);
@@ -56,6 +99,11 @@ async function readAntigravityData(baseDir?: string): Promise<AntigravityData> {
       } catch (error) {
         throw new Error('Antigravity conversation database could not be decoded; sync was stopped to preserve previous uploads', { cause: error });
       }
+      if (conversation.learnedModels) {
+        for (const [id, model] of conversation.learnedModels) {
+          rememberAntigravityModel(learnedModels, id, model);
+        }
+      }
       if (conversation.records.length) sessionsWithUsage.add(conversation.sessionId);
       for (const record of conversation.records) {
         const fallbackId = `${root}:${record.fallbackId}`;
@@ -64,12 +112,19 @@ async function readAntigravityData(baseDir?: string): Promise<AntigravityData> {
       }
     }
   }
+  // Resolve numeric-only model IDs across all scanned databases (learned names beat static fallback).
+  const resolvedRecords = records.map((record) => {
+    if (isConcreteAntigravityModel(record.model) || !record.modelId) return record;
+    const learned = learnedModels.get(record.modelId);
+    const resolved = learned || (learned === null ? undefined : ANTIGRAVITY_MODEL_IDS[record.modelId]);
+    return resolved ? { ...record, model: resolved } : record;
+  });
   const replacedLegacy = [...sessionsWithUsage].flatMap(session => {
     const previous = legacy.get(session);
     legacy.delete(session);
     return previous ? [previous] : [];
   });
-  return { records: deduplicateAntigravityUsage(records), contexts, legacy, replacedLegacy };
+  return { records: deduplicateAntigravityUsage(resolvedRecords), contexts, legacy, replacedLegacy };
 }
 
 export async function scanAntigravityDates(

@@ -114,6 +114,44 @@ export async function handleIngest(request: Request, env: Env): Promise<Response
         .bind(tokenPayload.deviceId, day.usageDate));
     }
 
+    if (day.breakdowns.some(b => b.product === 'claude-code' && b.channel === 'cli')) {
+      // Older CLI versions uploaded routed Claude Code models with gateway prefixes
+      // (e.g. group/auto-*, factory/*, grok/*) as provider/model, or duplicated
+      // mirrored sessions across two local projects. Replace local Claude Code CLI
+      // project rows (preserving project='unknown' API/CSV imports) and legacy
+      // routing-wrapper rows before upserting the fresh daily snapshot.
+      const hasLocalClaudeProjects = day.breakdowns.some(
+        b => b.product === 'claude-code' && b.channel === 'cli' && (b.project || 'unknown') !== 'unknown',
+      );
+      statements.push(env.DB.prepare(hasLocalClaudeProjects ? `
+        DELETE FROM daily_usage_breakdown
+        WHERE device_id = ? AND usage_date = ?
+          AND product = 'claude-code' AND channel = 'cli'
+          AND (
+            project != 'unknown'
+            OR provider IN ('group', 'factory', 'auto', 'opensource', 'grok')
+            OR model LIKE 'group/%'
+            OR model LIKE 'factory/%'
+            OR model LIKE 'auto/%'
+            OR model LIKE 'opensource/%'
+            OR model LIKE 'grok/%'
+          )
+      ` : `
+        DELETE FROM daily_usage_breakdown
+        WHERE device_id = ? AND usage_date = ?
+          AND product = 'claude-code' AND channel = 'cli'
+          AND (
+            provider IN ('group', 'factory', 'auto', 'opensource', 'grok')
+            OR model LIKE 'group/%'
+            OR model LIKE 'factory/%'
+            OR model LIKE 'auto/%'
+            OR model LIKE 'opensource/%'
+            OR model LIKE 'grok/%'
+          )
+      `)
+        .bind(tokenPayload.deviceId, day.usageDate));
+    }
+
     for (const { breakdown: b, cost, cacheWrite5mTokens, cacheWrite1hTokens } of breakdownsWithCost) {
       const rawProject = b.project || 'unknown';
       const isFullPath = rawProject.startsWith('/') || /^[A-Z]:\\/i.test(rawProject);

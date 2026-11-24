@@ -26,6 +26,8 @@ describe('catalog 结构', () => {
       ['opencode', 'opencode'],
       ['xai', 'opencode'],
       ['xai', 'copilot-cli'],
+      ['xai', 'claude-code'],
+      ['xai', 'grok-cli'],
     ];
     const missing = required.filter(([p, pr]) => !catalog.providers[p]?.[pr]);
     expect(missing).toEqual([]);
@@ -554,5 +556,46 @@ describe('November 2026 pricing gaps', () => {
     expect(calculateCost('google', 'gemini-cli', 'gemini-3.5-flash-lite', {
       inputTokens: 1_000_000, cachedInputTokens: 1_000_000, cacheWriteTokens: 0, outputTokens: 1_000_000,
     })).toMatchObject({ costStatus: 'exact', estimatedCostUsd: 2.83, resolvedModel: 'gemini-3.5-flash-lite' });
+  });
+});
+
+describe('Routed gateway models and Copilot CLI pricing', () => {
+  const shortTokens = {
+    inputTokens: 100_000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 100_000,
+  };
+
+  it.each([
+    ['group', 'claude-code', 'group/auto-claude-opus-5-5', 'claude-opus-5-5', 2.4],
+    ['group', 'claude-code', 'group/auto-claude-fable-5-2:high', 'claude-fable-5-2', 4.8],
+    ['factory', 'claude-code', 'factory/claude-fable-5.2', 'claude-fable-5-2', 4.8],
+    ['group', 'claude-code', 'group/auto-grok-4-7', 'grok-4.7', 0.8],
+    ['grok', 'claude-code', 'grok/grok-4.7', 'grok-4.7', 0.8],
+    ['xai', 'claude-code', 'grok-4.7', 'grok-4.7', 0.8],
+  ])('prices %s/%s/%s via %s at $%s', (provider, product, model, resolvedModel, expectedCost) => {
+    expect(calculateCost(provider, product, model, shortTokens)).toMatchObject({
+      costStatus: 'exact', resolvedModel, estimatedCostUsd: expectedCost,
+    });
+  });
+
+  it.each([
+    ['claude-sonnet-5.5', 'claude-sonnet-5-5', 1.2],
+    ['gpt-6-luna', 'gpt-6-luna', 0.06],
+  ])('prices github/copilot-cli/%s via %s at $%s', (model, resolvedModel, expectedCost) => {
+    expect(calculateCost('github', 'copilot-cli', model, shortTokens)).toMatchObject({
+      costStatus: 'exact', resolvedModel, estimatedCostUsd: expectedCost,
+    });
+  });
+
+  it.each([
+    ['gemini-pro-orchestrator-neon', 'gemini-4-neon'],
+    ['gemini-pro-orchestrator-g1-pro', 'gemini-4-argon'],
+    ['gemini-3-flash-agent-a', 'gemini-3.5-flash'],
+    ['gemini-3-flash', 'gemini-3-flash-preview'],
+    ['gemini-3.5-flash-extra-low', 'gemini-3.5-flash'],
+  ])('normalizes Antigravity orchestrator/variant model %s to %s', (model, resolvedModel) => {
+    const r = calculateCost('google', 'antigravity', model, shortTokens);
+    expect(r.resolvedModel).toBe(resolvedModel);
+    expect(r.estimatedCostUsd).toBeGreaterThan(0);
+    expect(r.costStatus).not.toBe('unavailable');
   });
 });
